@@ -1,0 +1,2 @@
+# SimpleChatApplication
+インターンシップで作成した物を作り直しました
