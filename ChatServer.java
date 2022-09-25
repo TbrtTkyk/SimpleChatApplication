@@ -12,16 +12,25 @@ import java.nio.channels.*;
 import java.nio.charset.*;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.*;
 
 public class ChatServer {
+  private static Random random = new Random();
   private static ServerSocketChannel channel;
   private static Selector selector;
   private static CharsetEncoder encoder;
   private static CharsetDecoder decoder;
   private static List<SocketChannel> clients = new ArrayList<>();
   private static Map<String, String> nameList = new HashMap<>();
+
+  // フィルタ関数
+  private static List<String> NGWordList = Arrays.asList("バカ", "クソ", "アホ");
+  private static Function<String, String> nameCommandFilter;  // 名前に含まれるコマンド除去フィルタ
+  private static Function<String, String> nameRegisterFilter; // 名前登録の際のフィルタ
+  private static Function<String, String> nameFilter;         // 名前に関するフィルタ
+  private static Function<String, String> messageFilter;      // メッセージに関するフィルタ
 
   // 特殊コマンド定義
   // 「@help」でコマンド一覧を自分に送信する
@@ -36,6 +45,37 @@ public class ChatServer {
   private static Pattern memberPattern = Pattern.compile("@member[ |　]*");
 
   public static void main(String[] args) {
+    // フィルタ関数定義
+    // 名前に含まれるコマンドを除去するフィルタ
+    nameCommandFilter = (String name) -> name.replaceAll("@help", "@HELP")
+      .replaceAll("@member", "@MEMBER")
+      .replaceAll("@wisper", "@WISPER")
+      .replaceAll("@random", "@RANDOM")
+      .replaceAll("@dice", "@DICE");
+    // 参加者抽選フィルタ
+    Function<String, String> randomMemberFilter = (String message) -> {
+      while (message.matches(".*@random.*"))
+        message = message.replaceFirst("@random", getRandomMember("<参加者なし>"));
+      return message;
+    };
+    // ダイスロールフィルタ
+    Function<String, String> diceFilter = (String message) -> {
+      while (message.matches(".*@dice.*"))
+        message = message.replaceFirst("@dice", String.format("%02d", random.nextInt(100)));
+      return message;
+    };
+    // NGワードフィルタ
+    Function<String, String> NGWordFilter = (String message) -> {
+      for (String word : NGWordList) {
+        message = message.replaceAll(word, "***");
+      }
+      return message;
+    };
+    // 名前・メッセージに対するフィルタ定義
+    nameRegisterFilter  = (str) -> NGWordFilter.apply(nameCommandFilter.apply(str));
+    nameFilter = (str) -> NGWordFilter.apply(nameCommandFilter.apply(randomMemberFilter.apply(str)));
+    messageFilter = (str) -> NGWordFilter.apply(randomMemberFilter.apply(diceFilter.apply(str)));
+
     try {
       System.out.println("┌──────────────────────────────────┐\n" +
           "│         Start ChatServer         │\n" +
@@ -119,6 +159,7 @@ public class ChatServer {
         String clientAddr = sc.getRemoteAddress().toString();
         if (!nameList.containsKey(clientAddr)) {
           // 不明のクライアントの最初のメッセージを名前として登録する
+          result = nameRegisterFilter.apply(result);
           System.out.println("名前登録: " + clientAddr +  " <--> " + result);
           nameList.put(clientAddr, result);
           serverMessage(result + "さんが入室しました。");
@@ -130,18 +171,19 @@ public class ChatServer {
           Matcher memberMatcher = memberPattern.matcher(result);
           if (helpMatcher.find()) {
             // コマンドリストを取得する
-            sc.write(encoder.encode(CharBuffer.wrap(helpMessage)));
+            send(sc, helpMessage);
           } else if (wisperMatcher.find()) {
             // 特定のクライアントに囁く
-            String target = wisperMatcher.group(1);
+            String target = nameFilter.apply(wisperMatcher.group(1));
             String message = wisperMatcher.group(2);
             wisper(sc, target, message);
           } else if (memberMatcher.find()) {
             // サーバーに接続しているクライアントの名前を送り返す
-            sc.write(encoder.encode(CharBuffer.wrap("<参加者>" + getMember("、", "なし"))));
+            send(sc, "<参加者>" + getMember("、", "なし"));
           } else {
             // 全体に伝える（通常メッセージ）
-            sc.write(encoder.encode(CharBuffer.wrap("<発言>" + result)));
+            result = messageFilter.apply(result);
+            send(sc, "<発言>" + result);
             textMessage(sc, result);
           }
         }
@@ -174,7 +216,7 @@ public class ChatServer {
         throw new UncheckedIOException(e);
       }
     };
-    String filteredMessage = message;
+    String filteredMessage = messageFilter.apply(message);
     sendToFilteredClient("[" + getName(sc) + "]" + filteredMessage, func);
   }
 
@@ -194,7 +236,7 @@ public class ChatServer {
         throw new UncheckedIOException(e);
       }
     };
-    String filteredMessage = message;
+    String filteredMessage = messageFilter.apply(message);
     sendToFilteredClient("<wisper>[" + getName(sc) + "]" + filteredMessage, func);
   }
 
@@ -225,11 +267,21 @@ public class ChatServer {
       }
 
       if (func.test(client)) {
-        client.write(encoder.encode(CharBuffer.wrap(message)));
+        send(client, message);
       }
     }
   }
 
+  /**
+   * 特定の人にメッセージを送る
+   * 
+   * @param sc      送信対象のクライアント
+   * @param message 送信するメッセージ
+   * @throws IOException
+   */
+  private static void send(SocketChannel sc, String message) throws IOException {
+    sc.write(encoder.encode(CharBuffer.wrap(message)));
+  }
 
   /**
    * アドレス(SocketChannel)から名前を取得する
@@ -270,6 +322,21 @@ public class ChatServer {
         text += separator;
     }
     return text;
+  }
+
+  /**
+   * ランダムな参加者の名前を取得する。
+   * 
+   * @param emptyCase 参加者が誰もいなかった場合のテキスト
+   * @return ランダムな参加者の名前
+   */
+  private static String getRandomMember(String emptyCase) {
+    if (nameList.isEmpty())
+      return emptyCase;
+    // 名前を配列に変換し、取得するインデックスを乱数で決める
+    int pick = random.nextInt(nameList.size());
+    String[] names = nameList.values().toArray(new String[0]);
+    return names[pick];
   }
 
   /**
